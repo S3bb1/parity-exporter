@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const fetch = require('node-fetch')
+const request = require('request-promise-native')
 const polka = require('polka')
 const yargs = require('yargs')
 const winston = require('winston')
@@ -29,9 +29,9 @@ function getArgs () {
       describe: 'Provide metrics on host:port/metrics',
       type: 'string'
     })
-    .option('node', {
-      default: 'http://localhost:8545/',
-      describe: 'Fetch info from this node'
+    .option('nodes', {
+      describe: 'Fetch info from this nodes',
+      type: 'array'
     })
     .version()
     .help('help').alias('help', 'h')
@@ -39,7 +39,8 @@ function getArgs () {
 }
 
 async function makeRequest (url, method, params = []) {
-  const res = await fetch(url, {
+  const res = await request({
+    url: url,
     method: 'POST',
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -50,29 +51,17 @@ async function makeRequest (url, method, params = []) {
     headers: {
       'Accept': 'application/json',
       'Content-Type': 'application/json'
-    }
+    },
+    rejectUnauthorized:false
   })
 
-  const json = await res.json()
+  const json = JSON.parse(res)
   if (json.error) throw new Error(`RPC error for ${url} (code: ${json.error.code}): ${json.error.message}`)
 
   return json.result
 }
 
-function initParityMetrics (registry, nodeURL) {
-  const createGauge = (name, help, labelNames) => new Gauge({ name, help, labelNames, registers: [registry] })
-
-  const gauges = {
-    version: createGauge('parity_version', 'Client version', ['value']),
-    chain: createGauge('parity_chain', 'Client chain', ['value']),
-    latest: {
-      hash: createGauge('parity_latest', 'Latest block information', ['hash']),
-      sync: createGauge('bitcoind_blockchain_sync', 'Blockchain sync info', ['type'])
-    },
-    gasPrice: createGauge('parity_gas_price', 'Current gas price in wei', []),
-    mempool: createGauge('parity_mempool_size', 'Mempool information', ['type']),
-    peers: createGauge('parity_peers', 'Connected peers', ['version'])
-  }
+function initParityMetrics (registry, nodeURL, gauges) {
 
   const data = {
     version: '',
@@ -83,34 +72,37 @@ function initParityMetrics (registry, nodeURL) {
   }
 
   return async () => {
+
+    const start = new Date().getTime();
+    const clientVersion = await makeRequest(nodeURL, 'web3_clientVersion');
+    const elapsed = new Date().getTime() - start;
+    gauges.responseTime.set({ instance: nodeURL }, elapsed)
+    gauges.up.set({ instance: nodeURL }, 1)
+
     const [
-      clientVersion,
       clientChain,
       latestBlock,
       syncInfo,
-      gasPrice,
       mempool,
       peersInfo
     ] = await Promise.all([
-      makeRequest(nodeURL, 'web3_clientVersion'),
       makeRequest(nodeURL, 'parity_chain'),
       makeRequest(nodeURL, 'eth_getBlockByNumber', ['latest', false]),
       makeRequest(nodeURL, 'eth_syncing'),
-      makeRequest(nodeURL, 'eth_gasPrice'),
       makeRequest(nodeURL, 'parity_allTransactions'),
       makeRequest(nodeURL, 'parity_netPeers')
     ])
 
     // version
     if (data.version !== clientVersion) {
-      gauges.version.set({ value: clientVersion }, 1)
+      gauges.version.set({ value: clientVersion, instance: nodeURL }, 1)
       data.version = clientVersion
       logger.info(`update version to ${clientVersion}`)
     }
 
     // chain
     if (data.chain !== clientChain) {
-      gauges.chain.set({ value: clientChain }, 1)
+      gauges.chain.set({ value: clientChain, instance: nodeURL }, 1)
       data.chain = clientChain
       logger.info(`update chain to ${clientChain}`)
     }
@@ -119,7 +111,7 @@ function initParityMetrics (registry, nodeURL) {
     if (data.latest !== latestBlock.hash) {
       const [hash, number] = [latestBlock.hash, parseInt(latestBlock.number, 16)]
       if (data.latest) delete gauges.latest.hash.hashMap[hashObject({ hash: data.latest })]
-      gauges.latest.hash.set({ hash }, number)
+      gauges.latest.hash.set({ hash, instance: nodeURL }, number)
       data.latest = hash
       logger.info(`update latest to ${number} - ${hash}`)
 
@@ -127,22 +119,15 @@ function initParityMetrics (registry, nodeURL) {
         ? [parseInt(syncInfo.currentBlock, 16), parseInt(syncInfo.highestBlock, 16)]
         : [number, number]
 
-      gauges.latest.sync.set({ type: 'current' }, current)
-      gauges.latest.sync.set({ type: 'highest' }, highest)
-      gauges.latest.sync.set({ type: 'progress' }, parseFloat((current / highest).toFixed(5)))
+      gauges.latest.sync.set({ type: 'current', instance: nodeURL }, current)
+      gauges.latest.sync.set({ type: 'highest', instance: nodeURL }, highest)
+      gauges.latest.sync.set({ type: 'progress', instance: nodeURL }, parseFloat((current / highest).toFixed(5)))
     }
 
-    // gas price
-    if (data.gasPrice !== gasPrice) {
-      const value = parseInt(gasPrice, 16)
-      gauges.gasPrice.set(value)
-      data.gasPrice = gasPrice
-      logger.info(`update gas price to: ${value}`)
-    }
 
     // mempool
-    gauges.mempool.set({ type: 'size' }, mempool.length)
-    gauges.mempool.set({ type: 'bytes' }, mempool.reduce((total, tx) => total + tx.raw.length - 2, 0))
+    gauges.mempool.set({ type: 'size', instance: nodeURL }, mempool.length)
+    gauges.mempool.set({ type: 'bytes', instance: nodeURL }, mempool.reduce((total, tx) => total + tx.raw.length - 2, 0))
 
     // peers
     // const peers = peersInfo.peers.filter((peer) => peer.network.remoteAddress !== 'Handshake')
@@ -153,25 +138,43 @@ function initParityMetrics (registry, nodeURL) {
     //   if (value === 0) delete gauges.peers.hashMap[hashObject({ version })]
     //   else gauges.peers.set({ version }, value)
     // }
-    gauges.peers.set({ version: 'all' }, peersInfo.connected)
+    gauges.peers.set({ version: 'all', instance: nodeURL }, peersInfo.connected)
   }
 }
 
-function createPrometheusClient (args) {
-  const register = new Registry()
+function createPrometheusClient (register, node, gauges) {
   return {
-    update: initParityMetrics(register, args.node),
-    onRequest (req, res) {
-      res.setHeader('Content-Type', register.contentType)
-      res.end(register.metrics())
-    }
+    update: initParityMetrics(register, node, gauges)
   }
 }
 
 async function main () {
   const args = getArgs()
-  const promClient = createPrometheusClient(args)
-  await polka().get('/metrics', promClient.onRequest).listen(args.listen)
+  const promClients = []
+  const register = new Registry()
+  const createGauge = (name, help, labelNames) => new Gauge({ name, help, labelNames, registers: [register] })
+
+  function onRequest (req, res) {
+    res.setHeader('Content-Type', register.contentType)
+    res.end(register.metrics())
+  }
+
+  const gauges = {
+    version: createGauge('parity_version', 'Client version', ['value', 'instance']),
+    chain: createGauge('parity_chain', 'Client chain', ['value', 'instance']),
+    responseTime: createGauge('parity_responseTime', 'Response time', ['instance']),
+    up: createGauge('partiy_up', 'Is service up?', ['instance']),
+    latest: {
+      hash: createGauge('parity_latest', 'Latest block information', ['hash', 'instance']),
+      sync: createGauge('bitcoind_blockchain_sync', 'Blockchain sync info', ['type', 'instance'])
+    },
+    mempool: createGauge('parity_mempool_size', 'Mempool information', ['type', 'instance']),
+    peers: createGauge('parity_peers', 'Connected peers', ['version', 'instance'])
+  }
+  for(let node of args.nodes) {
+    promClients.push(createPrometheusClient(register, node, gauges))
+  }
+  await polka().get('/metrics', onRequest).listen(args.listen)
   logger.info(`listen at ${args.listen.hostname}:${args.listen.port}`)
 
   process.on('SIGINT', () => process.exit(0))
@@ -179,7 +182,7 @@ async function main () {
 
   while (true) {
     const ts = Date.now()
-    await promClient.update()
+    await Promise.all(promClients.map((client) => client.update()))
     const delay = Math.max(10, args.interval - (Date.now() - ts))
     await new Promise((resolve) => setTimeout(resolve, delay))
   }
